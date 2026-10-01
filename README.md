@@ -63,3 +63,11 @@ For VS Code or Cursor:
 If you're not using Claude, and you're client supports http streaming directly, you will just need the local URL and `/mcp` extension as in the VS Code/Cursor example above.
 
 Remember for streamable http (including mcp-remote), you need your mcp server to be running [(as opposed to the client launching it for you as with stdio)](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#stdio).
+
+### Validating the MCP 2026-07-28 spec features
+
+The server answers `server/discover` and `subscriptions/listen` out of the box. With the server running, check both with:
+
+`$ uv run python scripts/validate_spec.py http://localhost:8000/mcp`
+
+The server never changes its tools on its own, so a `listen` stream stays quiet. To see an event delivered, start the server with `MCP_SPEC_DEBUG=1`, which adds a `POST /debug/tools-list-changed` route that publishes a `toolsListChanged` event. Don't enable this on a publicly reachable instance.
