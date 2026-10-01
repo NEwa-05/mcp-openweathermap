@@ -1,8 +1,9 @@
 from typing import Any
 import httpx
 import logging
-from fastmcp import FastMCP
-from fastmcp.server.auth.providers.github import GitHubProvider
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp_types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import Response, JSONResponse, RedirectResponse
 from dotenv import load_dotenv
@@ -12,82 +13,60 @@ from sentry_config import init_sentry
 load_dotenv()
 init_sentry()
 
-# Set up logger
-logger = logging.getLogger(__name__)
-
-# Check for FastMCP auth environment variables
-fastmcp_client_id = os.getenv("FASTMCP_CLIENT_ID")
-fastmcp_client_secret = os.getenv("FASTMCP_CLIENT_SECRET")
-fastmcp_base_url = os.getenv("FASTMCP_BASE_URL")
-fastmcp_redirect_path = os.getenv("FASTMCP_REDIRECT_PATH")
 open_weather_api_key = os.getenv("OPEN_WEATHER_API_KEY")
 assert open_weather_api_key, "OPEN_WEATHER_API_KEY is not set"
 
-# Only create auth provider if all required variables are present
-auth_provider = None
-if all(
-    [fastmcp_client_id, fastmcp_client_secret, fastmcp_base_url, fastmcp_redirect_path]
-):
-    auth_provider = GitHubProvider(
-        client_id=fastmcp_client_id,
-        client_secret=fastmcp_client_secret,
-        base_url=fastmcp_base_url,
-        redirect_path=fastmcp_redirect_path,
-    )
+# Set up logger
+logger = logging.getLogger(__name__)
 
-# Initialize FastMCP server
-if auth_provider:
-    mcp = FastMCP(
-        "weather",
-        host="0.0.0.0",
-        port=8000,
-        streamable_http_path="/mcp",
-        auth=auth_provider,
-    )
-else:
-    mcp = FastMCP(
-        "weather",
-        host="0.0.0.0",
-        port=8000,
-        streamable_http_path="/mcp",
-    )
+# Initialize MCP server (transport settings are passed to run() in MCP SDK v2)
+mcp = MCPServer("weather", title="Weather")
 
 # Constants
-OPEN_WEATHER_API_BASE = "https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={open_weather_api_key}&units=imperial"
+OPEN_WEATHER_GEO_URL = "https://api.openweathermap.org/geo/1.0/direct"
+OPEN_WEATHER_WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
 USER_AGENT = "weather-app/1.0"
 
 
-async def make_nws_request(url: str) -> list[dict[str, Any]] | dict[str, Any] | None:
-    """Make a request to the NWS API with proper error handling.
+async def open_weather_get(url: str, params: dict[str, Any]) -> Any | None:
+    """Make a request to the OpenWeatherMap API with proper error handling.
 
-    Returns:
-        - list[dict[str, Any]] for geocoding responses
-        - dict[str, Any] for weather data responses
-        - None if the request fails
+    Returns the decoded JSON body, or None if the request fails. The request URL is never
+    logged because it carries the API key.
     """
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/geo+json"}
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    params = {**params, "appid": open_weather_api_key}
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(url, headers=headers, timeout=30.0)
+            response = await client.get(
+                url, params=params, headers=headers, timeout=30.0
+            )
             response.raise_for_status()
-            logger.info(f"Response: {response.json()}")
             return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"Weather API request failed with status {e.response.status_code}"
+            )
         except Exception as e:
-            logger.error(f"Weather API request failed: {str(e)}")
-            return None
+            logger.error(f"Weather API request failed: {type(e).__name__}")
+        return None
 
 
 async def get_lat_lon(city: str, state: str, country: str) -> tuple[float, float]:
     """Get the latitude and longitude for a city, state, and country."""
-    url = f"http://api.openweathermap.org/geo/1.0/direct?q={city},{state},{country}&appid={open_weather_api_key}"
-    data = await make_nws_request(url)
+    data = await open_weather_get(
+        OPEN_WEATHER_GEO_URL, {"q": f"{city},{state},{country}", "limit": 1}
+    )
     if not data:
         logger.error(f"Failed to get location data for {city}, {state}, {country}")
         raise ValueError("Could not get location data")
     return float(data[0]["lat"]), float(data[0]["lon"])
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Get current weather",
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
 async def get_current_weather(city: str, state: str, country: str) -> str:
     """
     Get the current weather for a location. If the city, state, or country are not provided, a reasonable guess should
@@ -96,30 +75,32 @@ async def get_current_weather(city: str, state: str, country: str) -> str:
     logger.info(f"Weather request for {city}, {state}, {country}")
 
     try:
-        # Get coordinates and weather data
         lat, lon = await get_lat_lon(city, state, country)
-        points_data = await make_nws_request(
-            OPEN_WEATHER_API_BASE.format(
-                lat=lat, lon=lon, open_weather_api_key=open_weather_api_key
-            )
+    except Exception as e:
+        logger.error(f"Error getting location for {city}, {state}, {country}: {e}")
+        raise ToolError(
+            f"Could not find a location matching {city}, {state}, {country}."
         )
 
-        if not points_data:
-            return "Unable to fetch forecast data for this location."
+    weather_data = await open_weather_get(
+        OPEN_WEATHER_WEATHER_URL, {"lat": lat, "lon": lon, "units": "imperial"}
+    )
+    if not weather_data:
+        raise ToolError("Unable to fetch weather data for this location.")
 
-        # Extract weather data
-        weather_main = points_data["weather"][0]["main"]
-        weather_description = points_data["weather"][0]["description"]
-        weather_temp = points_data["main"]["temp"]
-        weather_feels_like = points_data["main"]["feels_like"]
-        weather_humidity = points_data["main"]["humidity"]
+    try:
+        weather_main = weather_data["weather"][0]["main"]
+        weather_description = weather_data["weather"][0]["description"]
+        weather_temp = weather_data["main"]["temp"]
+        weather_feels_like = weather_data["main"]["feels_like"]
+        weather_humidity = weather_data["main"]["humidity"]
+    except (KeyError, IndexError, TypeError):
+        logger.error(
+            f"Unexpected weather response shape for {city}, {state}, {country}"
+        )
+        raise ToolError(f"Received unexpected weather data for {city}.")
 
-        return f"The current weather is {weather_main} with a description of {weather_description}. The temperature is {weather_temp} degrees Fahrenheit. The feels like temperature is {weather_feels_like} degrees Fahrenheit. The humidity is {weather_humidity}%."
-
-    except Exception as e:
-        # Log any exceptions as errors
-        logger.error(f"Error getting weather for {city}, {state}, {country}: {str(e)}")
-        return f"Sorry, I encountered an error while fetching weather data for {city}."
+    return f"The current weather is {weather_main} with a description of {weather_description}. The temperature is {weather_temp} degrees Fahrenheit. The feels like temperature is {weather_feels_like} degrees Fahrenheit. The humidity is {weather_humidity}%."
 
 
 @mcp.custom_route("/", methods=["GET"])
@@ -138,7 +119,13 @@ async def health_check(request: Request) -> Response:
 if __name__ == "__main__":
     logger.info("Starting weather MCP server")
     try:
-        mcp.run(transport="streamable-http")
+        mcp.run(
+            transport="streamable-http",
+            host="0.0.0.0",
+            port=8000,
+            streamable_http_path="/mcp",
+            stateless_http=True,
+        )
     except Exception as e:
         logger.error(f"Failed to start server: {str(e)}")
         raise

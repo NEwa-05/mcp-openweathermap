@@ -6,13 +6,10 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "httpx>=0.28.1",
-    "mcp[cli]>=1.13.1",
+    "mcp[cli]>=2.0.0,<3",
     "ruff>=0.12.11",
     "sentry-sdk>=2.35.2",
     "ty>=0.0.1a19",
-    "fastmcp",
+    "python-dotenv>=1.0.1",
 ]
-
-[tool.uv.sources]
-fastmcp = { git = "https://github.com/jlowin/fastmcp.git", rev = "210e9cc5ca4003a0bcfac73399051a780b67a43a" }
 
